@@ -1,0 +1,33 @@
+# Ignore Terraform local state and directories
+.terraform/
+
+# Local TF state files
+*.tfstate
+*.tfstate.*
+
+# Crash log
+crash.log
+
+# Ignore override files and auto-generated plan files
+override.tf
+override.tf.json
+*_override.tf
+*.tfplan
+
+# Sensitive variables
+*.tfvars
+*.tfvars.json
+
+# Lock file (optional to commit, but commonly ignored)
+.terraform.lock.hcl
+
+# PEM files and private keys
+*.pem
+
+# IDE/editor folders (optional)
+.vscode/
+.idea/
+
+# All plan files and additional jsons such as cluster_info.json
+*.plan
+cluster_info.json

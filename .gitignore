@@ -15,7 +15,7 @@ override.tf.json
 *.tfplan
 
 # Sensitive variables
-*.tfvars
+# *.tfvars
 *.tfvars.json
 
 # Lock file (optional to commit, but commonly ignored)

@@ -15,162 +15,137 @@ Usage examples:
 # create plans
 make plan-dev
 make plan-prod
+ # Steps & Workflow
 
-# apply
+This repository uses a root-centric Terraform workflow with a small set of helper scripts and separate Kubernetes manifests in `kubefiles/`.
+
+## Makefile targets
+
+- `make init` — run `terraform init` for both `envs/dev` and `envs/prod`.
+- `make validate` — run `terraform validate` for both envs.
+- `make plan-dev` / `make plan-prod` — produce per-env plan files under `envs/`.
+- `make apply-dev` / `make apply-prod` — apply the per-env plan and append logs to `envs/<env>/apply.log`.
+- `make destroy-dev` / `make destroy-prod` — run `terraform destroy` for the selected env (see removal steps).
+
+## Folder structure
+
+- `envs/dev/` and `envs/prod/`: per-environment working folders (plan files, logs).
+- `modules/`: Terraform modules (`vpc`, `iam`, `eks`).
+- `dev.tfvars` / `prod.tfvars`: root tfvars used when running from the repository root.
+- `kubefiles/`: Kubernetes manifests for the sample application (kept outside Terraform).
+- `scripts/`: helper scripts (`checker.sh`, `kubernetes-service-check.sh`, `pre-destroy.sh`).
+
+## Deploying the sample application
+
+1. Create infra with Terraform (example):
+
+```bash
+make plan-dev
 make apply-dev
-make apply-prod
-
-# destroy
-make destroy-dev
 ```
 
-## Folder structure (important)
-
-- `envs/dev/` and `envs/prod/`: per-environment working folders used by the `Makefile` (plan files and logs are stored here).
-- `modules/`: Terraform modules (`vpc`, `iam`, `eks`).
-- `terraform/*.tfvars`: root tfvar files (dev.tfvars, prod.tfvars) used as the canonical env values when running from root; the Makefile passes these into the env plan commands.
-- `kubefiles/`: Kubernetes manifests for the sample application.
-
-## Deploying the sample application (after Terraform apply)
-
-1 Ensure kubeconfig is configured (example):
+1. Configure `kubectl` for the new cluster:
 
 ```bash
 aws eks update-kubeconfig --name $(terraform output -raw cluster_name) --region $(terraform output -raw region)
 ```
 
-2 Apply manifests
+1. Deploy application manifests and verify:
 
 ```bash
 kubectl apply -f kubefiles/
-```
-
-3 Verify deployments and services:
-
-```bash
 kubectl get pods,svc -n default
 ```
 
-## Troubleshooting
+## Scripts (helpers)
 
-- If `kubectl` reports "Unable to connect to the server":
-  - Verify `terraform output` for `cluster_name` and `cluster_endpoint`.
-  - Re-run `aws eks update-kubeconfig --name <cluster> --region <region>`.
-  - Confirm DNS resolution for the `cluster_endpoint`.
+- `scripts/checker.sh` — account/resource scanner (AWS CLI). Use to inspect EC2, EBS, EIPs, NAT gateways, VPC endpoints, LBs, RDS, EFS, S3, ASGs, and EKS clusters.
 
-- If pods are stuck Pulling or CrashLoopBackOff, describe the pod:
+### NOTE
+
+#### Before using this script ensure to provide your current deployed REGION variable
 
   ```bash
-    kubectl describe pod <pod-name>
-    kubectl logs <pod-name> --previous
+  ./scripts/checker.sh > scanner-output.json
   ```
 
-- Use the included quick-check script `kubefiles/service-check.sh` to validate the sample service is reachable. Example content and checks (quick summary):
-  - `service-check.sh` performs a `kubectl get svc` and attempts an HTTP `curl` against the service external IP.
-  - If external IP is pending, wait for the LoadBalancer and re-run.
+- `scripts/kubernetes-service-check.sh` — quick checks for `my-namespace` (svc/ingress/pods, port-forwarding examples, curl checks).
 
-## Delete / removal steps (short)
+ ```bash
+ ./scripts/kubernetes-service-check.sh
+ ```
 
-## Delete / removal steps (detailed)
+- `scripts/pre-destroy.sh` — deletes all Services of type `LoadBalancer` and waits for their AWS ingress entries to be removed. Requires `kubectl` and `jq` and a valid kubeconfig.
 
-These steps ensure Kubernetes-created cloud resources (LoadBalancers, ENIs, EIPs) are removed before deleting the VPC and other infra. Run these from your workstation.
+ ```bash
+ ./scripts/pre-destroy.sh
+ ```
 
-1 (Optional) Configure your environment variables used by commands below:
+## Delete / removal steps (recommended)
+
+Follow these steps to avoid orphaned AWS resources (LBs/ENIs/EIPs) that block VPC deletion.
+
+1. (Optional) Set helpful environment variables:
 
 ```bash
-export REGION=<your_deployed_region>
+export REGION=<your_deployed_location>
 export VPC=$(terraform output -raw public_vpc_id 2>/dev/null || echo "<your-vpc-id>")
 ```
 
-2 Delete Kubernetes LoadBalancer Services (imperative):
+1. Remove Kubernetes LoadBalancer services (imperative):
 
 ```bash
-# Ensure kubeconfig is configured for the cluster
+# Ensure kubeconfig points to the cluster
 aws eks update-kubeconfig --name $(terraform output -raw cluster_name) --region $(terraform output -raw region)
 
-# Delete any LoadBalancer services (prompt will show the list first)
-kubectl get svc --all-namespaces -o json | jq -r '.items[] | select(.spec.type=="LoadBalancer") | "\(.metadata.namespace) \(.metadata.name)"' | tee /tmp/lb-svcs.txt
-# Review /tmp/lb-svcs.txt and then delete:
-while read -r ns name; do kubectl delete svc -n "$ns" "$name" --ignore-not-found; done < /tmp/lb-svcs.txt
+# Delete LB services via helper
+./scripts/pre-destroy.sh
 ```
 
-3 Wait for AWS Load Balancers and ENIs to be deleted (polling):
+1. Verify AWS resource cleanup (poll until empty):
 
 ```bash
-# Poll for remaining ALBs/NLBs in the VPC
 aws elbv2 describe-load-balancers --region $REGION --query "LoadBalancers[?VpcId=='$VPC']" --output json
-# Poll ENIs
 aws ec2 describe-network-interfaces --region $REGION --filters Name=vpc-id,Values=$VPC --output json
 ```
 
-If any LoadBalancers or ENIs remain, wait a few minutes and re-check until they are gone.
-
-4 If LBs were created outside the cluster or cannot be removed with `kubectl`, delete them via AWS CLI:
+1. If LBs remain and cannot be removed via Kubernetes, delete them via AWS CLI (list ARNs then delete). If you manually delete resources, note them for state reconciliation.
 
 ```bash
-# List LBs in VPC
 aws elbv2 describe-load-balancers --region $REGION --query "LoadBalancers[?VpcId=='$VPC'].{Name:LoadBalancerName,ARN:LoadBalancerArn}" --output table
-# Delete by ARN
 aws elbv2 delete-load-balancer --region $REGION --load-balancer-arn <lb-arn>
 ```
 
-5 Release any Elastic IPs and delete NAT gateways (if present):
+1. Run Terraform destroy (Makefile wrapper or direct):
 
 ```bash
-# List EIPs
-aws ec2 describe-addresses --region $REGION --filters Name=domain,Values=vpc --output table
-# Disassociate & release (replace ids)
-aws ec2 disassociate-address --region $REGION --association-id <assoc-id>
-aws ec2 release-address --region $REGION --allocation-id <alloc-id>
-
-# List NAT gateways
-aws ec2 describe-nat-gateways --region $REGION --filter Name=vpc-id,Values=$VPC --output json
-aws ec2 delete-nat-gateway --region $REGION --nat-gateway-id <nat-id>
-```
-
-6 Detach and delete the Internet Gateway (if present):
-
-```bash
-aws ec2 describe-internet-gateways --region $REGION --filters Name=attachment.vpc-id,Values=$VPC --output json
-aws ec2 detach-internet-gateway --region $REGION --internet-gateway-id <igw-id> --vpc-id $VPC
-aws ec2 delete-internet-gateway --region $REGION --internet-gateway-id <igw-id>
-```
-
-7 Delete remaining subnets and security groups (non-default):
-
-```bash
-aws ec2 describe-subnets --region $REGION --filters Name=vpc-id,Values=$VPC --query 'Subnets[*].SubnetId' --output table
-aws ec2 delete-subnet --region $REGION --subnet-id <subnet-id>
-
-aws ec2 describe-security-groups --region $REGION --filters Name=vpc-id,Values=$VPC --output table
-# Delete non-default SGs at your discretion
-aws ec2 delete-security-group --region $REGION --group-id <sg-id>
-```
-
-8 Attempt Terraform destroy (from the appropriate env folder or root, as your workflow dictates):
-
-```bash
-# Example using Makefile wrapper
 make destroy-dev
-
-# Or run directly from envs folder
+# or
 cd envs/dev
 terraform destroy -var-file=../../dev.tfvars
 ```
 
-9 If Terraform errors because resources were removed manually, reconcile state:
+1. If you manually deleted resources, reconcile Terraform state:
 
 ```bash
-# List terraform-managed resources
 terraform state list
-# Remove entries for resources you manually deleted
 terraform state rm <resource-address>
 ```
 
-Notes:
+## Troubleshooting notes
 
-- Deleting LBs and ENIs can take several minutes; wait until `describe-network-interfaces` returns no entries for the VPC.
-- Use `aws ec2 describe-instances` and `aws eks describe-cluster` to verify instances and cluster state.
-- Keep a copy of `envs/<env>/destroy.log` for auditing and debugging if deletes fail.
+- Deleting LBs/ENIs can take several minutes — re-check `describe-network-interfaces` until empty.
+- If `kubectl` cannot connect, re-run the `aws eks update-kubeconfig` step and confirm DNS resolution of the cluster endpoint.
+- Keep `envs/<env>/destroy.log` for debugging.
+- Keep in mind destroying resources permanently removes AWS assets and may incur data loss. Review plan logs before applying destroy.
 
-Keep in mind destroying removes AWS resources and may incur data loss; review the plan logs before applying destroy.
+terraform state list
+terraform state rm ```<resource-address>```
+
+- Deleting LBs/ENIs can take several minutes — re-check `describe-network-interfaces` until empty.
+- If `kubectl` cannot connect, follow the `aws eks update-kubeconfig` step and confirm DNS resolution of the cluster endpoint.
+- Keep `envs/<env>/destroy.log` for debugging.
+
+Keep in mind destroying removes AWS resources and may incur data loss; review plans before applying destroy.
+
+aws ec2 release-address --region $REGION --allocation-id ```<alloc-id>```

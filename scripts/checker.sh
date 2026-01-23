@@ -4,7 +4,7 @@ set -euo pipefail
 echo "Running account-wide resource scan across all regions..."
 
 # REGIONS=$(aws ec2 describe-regions --query "Regions[].RegionName" --output text)
-REGIONS=eu-west-1
+REGIONS="<your_deployed_regions_here>" # e.g., us-east-1 us-west-2
 
 for r in $REGIONS; do
   echo
